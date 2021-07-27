@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,11 +16,17 @@ import (
 )
 
 var (
-	device = flag.String("device", "default", "implementation of ble")
-	name   = flag.String("name", "Gopher", "name of remote peripheral")
-	addr   = flag.String("addr", "", "address of remote peripheral (MAC on Linux, UUID on OS X)")
-	sub    = flag.Duration("sub", 0, "subscribe to notification and indication for a specified period, 0 for indefinitely")
-	sd     = flag.Duration("sd", 15*time.Second, "scanning duration, 0 for indefinitely")
+	device  = flag.String("device", "default", "implementation of ble")
+	name    = flag.String("name", "Gopher", "name of remote peripheral")
+	addr    = flag.String("addr", "", "address of remote peripheral (MAC on Linux, UUID on OS X)")
+	sub     = flag.Duration("sub", 0, "subscribe to notification and indication for a specified period, 0 for indefinitely")
+	sd      = flag.Duration("sd", 15*time.Second, "scanning duration, 0 for indefinitely")
+	quiet   = flag.Bool("quiet", false, "Do not show notifications in stdout")
+	web     = flag.Bool("web", false, "Make data available via HTTP (ignores -sub)")
+	webBind = flag.String("web-bind", "127.0.0.1:8989", "Address and port to bind the web webserver (-web)")
+
+	temperature      = 0.0
+	humidity    byte = 0
 )
 
 func main() {
@@ -86,11 +93,48 @@ func main() {
 	// subscribe notifications
 	subscribe(cln, tempChar)
 
+	defer func() {
+		if err := cln.Unsubscribe(tempChar, false); err != nil {
+			log.Fatalf("unsubscribe failed: %s", err)
+		}
+		fmt.Printf("-- Unsubscribe to notification --\n")
+	}()
+
+	if *web {
+		startWeb()
+	} else {
+		if *sub == 0 {
+			for {
+				time.Sleep(time.Hour)
+			}
+		} else {
+			time.Sleep(*sub)
+		}
+	}
+
 	// Disconnect the connection. (On OS X, this might take a while.)
 	fmt.Printf("Disconnecting [ %s ]... (this might take up to few seconds on OS X)\n", cln.Addr())
 	cln.CancelConnection()
 
 	<-done
+}
+
+func startWeb() {
+	fmt.Println(`Up and running!
+	curl http://` + *webBind + `/
+To see the data.
+`)
+	http.HandleFunc("/", httpHandler)
+	log.Fatal(http.ListenAndServe(*webBind, nil))
+}
+
+func httpHandler(w http.ResponseWriter, r *http.Request) {
+	// avoid overhead of JSON marshalling when output is so simple!
+	fmt.Fprintf(w, `{
+		"temperature": %0.2f,
+		"humidity": %d
+}
+`, temperature, humidity)
 }
 
 func findTemperatureCharacteristic(cln ble.Client, p *ble.Profile) *ble.Characteristic {
@@ -112,9 +156,8 @@ func subscribe(cln ble.Client, c *ble.Characteristic) error {
 	fmt.Printf("\n-- Subscribed notification --\n")
 	h := func(req []byte) {
 		buf := bytes.NewReader(req)
-		var temperature int16
-		var humidity byte
-		err := binary.Read(buf, binary.LittleEndian, &temperature)
+		var temperature_i int16
+		err := binary.Read(buf, binary.LittleEndian, &temperature_i)
 		if err != nil {
 			fmt.Printf("binary read failed: %v on [ % X ]\n", err, req)
 		}
@@ -122,25 +165,15 @@ func subscribe(cln ble.Client, c *ble.Characteristic) error {
 		if err != nil {
 			fmt.Printf("binary read failed: %v on [ % X ]\n", err, req)
 		}
-		fmt.Println("Temperature: ", float64(temperature)/100)
-		fmt.Println("Humidity:    ", humidity)
+		temperature = float64(temperature_i) / 100
+		if !*quiet {
+			fmt.Println("Temperature: ", temperature)
+			fmt.Println("Humidity:    ", humidity)
+		}
 	}
 	if err := cln.Subscribe(c, false, h); err != nil {
 		log.Fatalf("subscribe failed: %s", err)
-	}
-	defer func() {
-		if err := cln.Unsubscribe(c, false); err != nil {
-			log.Fatalf("unsubscribe failed: %s", err)
-		}
-		fmt.Printf("-- Unsubscribe to notification --\n")
-	}()
-
-	if *sub == 0 {
-		for {
-			time.Sleep(time.Hour)
-		}
-	} else {
-		time.Sleep(*sub)
+		return err
 	}
 	return nil
 }
