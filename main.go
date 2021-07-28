@@ -131,8 +131,8 @@ To see the data.
 func httpHandler(w http.ResponseWriter, r *http.Request) {
 	// avoid overhead of JSON marshalling when output is so simple!
 	fmt.Fprintf(w, `{
-		"temperature": %0.2f,
-		"humidity": %d
+	"temperature": %0.2f,
+	"humidity": %d
 }
 `, temperature, humidity)
 }
