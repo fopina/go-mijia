@@ -25,8 +25,10 @@ var (
 	web     = flag.Bool("web", false, "Make data available via HTTP (ignores -sub)")
 	webBind = flag.String("web-bind", "127.0.0.1:8989", "Address and port to bind the web webserver (-web)")
 
+	isConnected      = false
 	temperature      = 0.0
 	humidity    byte = 0
+	lastUpdate  time.Time
 )
 
 func main() {
@@ -57,6 +59,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("can't connect : %s", err)
 	}
+	isConnected = true
 
 	// Make sure we had the chance to print out the message.
 	done := make(chan struct{})
@@ -66,6 +69,8 @@ func main() {
 	go func() {
 		<-cln.Disconnected()
 		fmt.Printf("[ %s ] is disconnected \n", cln.Addr())
+		// should app be terminated here? or restart scanning?
+		isConnected = false
 		close(done)
 	}()
 
@@ -132,9 +137,11 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	// avoid overhead of JSON marshalling when output is so simple!
 	fmt.Fprintf(w, `{
 	"temperature": %0.2f,
-	"humidity": %d
+	"humidity": %d,
+	"connected": %v,
+	"lastUpdate": %v
 }
-`, temperature, humidity)
+`, temperature, humidity, isConnected, lastUpdate)
 }
 
 func findTemperatureCharacteristic(cln ble.Client, p *ble.Profile) *ble.Characteristic {
@@ -155,6 +162,7 @@ func findTemperatureCharacteristic(cln ble.Client, p *ble.Profile) *ble.Characte
 func subscribe(cln ble.Client, c *ble.Characteristic) error {
 	fmt.Printf("\n-- Subscribed notification --\n")
 	h := func(req []byte) {
+		lastUpdate = time.Now()
 		buf := bytes.NewReader(req)
 		var temperature_i int16
 		err := binary.Read(buf, binary.LittleEndian, &temperature_i)
