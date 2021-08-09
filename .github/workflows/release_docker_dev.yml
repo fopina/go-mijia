@@ -1,4 +1,4 @@
-name: publish to dockerhub
+name: publish DEV to dockerhub
 
 on:
   push:
