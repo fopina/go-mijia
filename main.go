@@ -139,9 +139,9 @@ func httpHandler(w http.ResponseWriter, r *http.Request) {
 	"temperature": %0.2f,
 	"humidity": %d,
 	"connected": %v,
-	"lastUpdate": %v
+	"lastUpdate": "%v"
 }
-`, temperature, humidity, isConnected, lastUpdate)
+`, temperature, humidity, isConnected, lastUpdate.Format("2006-01-02T15:04:05-0700"))
 }
 
 func findTemperatureCharacteristic(cln ble.Client, p *ble.Profile) *ble.Characteristic {
