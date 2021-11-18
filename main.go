@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 )
 
 var (
+	scan    = flag.Bool("scan", false, "Scan BLE peripherals - using this flag ignores every flag except -sd")
 	device  = flag.String("device", "default", "implementation of ble")
 	name    = flag.String("name", "Gopher", "name of remote peripheral")
 	addr    = flag.String("addr", "", "address of remote peripheral (MAC on Linux, UUID on OS X)")
@@ -39,6 +42,11 @@ func main() {
 		log.Fatalf("can't new device : %s", err)
 	}
 	ble.SetDefaultDevice(d)
+
+	if *scan {
+		startScan()
+		return
+	}
 
 	// Default to search device with name of Gopher (or specified by user).
 	filter := func(a ble.Advertisement) bool {
@@ -122,6 +130,20 @@ func main() {
 	cln.CancelConnection()
 
 	<-done
+}
+
+func startScan() {
+	handleAdv := func(a ble.Advertisement) {
+		fmt.Println(a.Addr(), a.LocalName())
+	}
+	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), *sd))
+	err := ble.Scan(ctx, false, handleAdv, nil)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && os.IsTimeout(err) {
+			return
+		}
+		log.Fatal((err))
+	}
 }
 
 func startWeb() {
