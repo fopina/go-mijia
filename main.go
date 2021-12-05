@@ -4,35 +4,48 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/go-ble/ble"
 	"github.com/go-ble/ble/examples/lib/dev"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
+	scan    = flag.Bool("scan", false, "Scan BLE peripherals - using this flag ignores every flag except -sd")
 	device  = flag.String("device", "default", "implementation of ble")
-	name    = flag.String("name", "Gopher", "name of remote peripheral")
+	name    = flag.String("name", "ATC", "name of remote peripheral")
 	addr    = flag.String("addr", "", "address of remote peripheral (MAC on Linux, UUID on OS X)")
-	sub     = flag.Duration("sub", 0, "subscribe to notification and indication for a specified period, 0 for indefinitely")
+	atc     = flag.Bool("atc", false, "ATC mode: do not connect, simply monitor ATC custom advertisement data - this only uses -sub parameter, not -sd")
+	sub     = flag.Duration("sub", 0, "subscribe to notification and indication (or monitor, in case of -atc) for a specified period, 0 for indefinitely")
 	sd      = flag.Duration("sd", 15*time.Second, "scanning duration, 0 for indefinitely")
 	quiet   = flag.Bool("quiet", false, "Do not show notifications in stdout")
+	debug   = flag.Bool("debug", false, "Debug verbosity")
 	web     = flag.Bool("web", false, "Make data available via HTTP (ignores -sub)")
 	webBind = flag.String("web-bind", "127.0.0.1:8989", "Address and port to bind the web webserver (-web)")
 
 	isConnected      = false
 	temperature      = 0.0
 	humidity    byte = 0
+	battery     byte = 0
 	lastUpdate  time.Time
+	// used by ATC mode
+	lastFrame byte = 0
 )
 
 func main() {
 	flag.Parse()
+
+	if *debug {
+		log.SetLevel(log.DebugLevel)
+	}
 
 	d, err := dev.NewDevice(*device)
 	if err != nil {
@@ -40,7 +53,12 @@ func main() {
 	}
 	ble.SetDefaultDevice(d)
 
-	// Default to search device with name of Gopher (or specified by user).
+	if *scan {
+		startScan()
+		return
+	}
+
+	// Default to search device with name of ATC (or specified by user).
 	filter := func(a ble.Advertisement) bool {
 		return strings.ToUpper(a.LocalName()) == strings.ToUpper(*name)
 	}
@@ -52,8 +70,38 @@ func main() {
 		}
 	}
 
+	var cln ble.Client
+	var done <-chan struct{}
+
+	if *atc {
+		done = atcMode(filter)
+	} else {
+		cln, done = connectMode(filter)
+	}
+
+	if *web {
+		startWeb()
+	} else {
+		if *sub == 0 {
+			for {
+				time.Sleep(time.Hour)
+			}
+		} else {
+			time.Sleep(*sub)
+		}
+	}
+
+	if !*atc {
+		// Disconnect the connection. (On OS X, this might take a while.)
+		log.Info("Disconnecting [ %s ]... (this might take up to few seconds on OS X)\n", cln.Addr())
+		cln.CancelConnection()
+	}
+	<-done
+}
+
+func connectMode(filter ble.AdvFilter) (ble.Client, <-chan struct{}) {
 	// Scan for specified durantion, or until interrupted by user.
-	fmt.Printf("Scanning for %s...\n", *sd)
+	log.Info("Scanning for %s...\n", *sd)
 	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), *sd))
 	cln, err := ble.Connect(ctx, filter)
 	if err != nil {
@@ -68,7 +116,7 @@ func main() {
 	// So we wait(detect) the disconnection in the go routine.
 	go func() {
 		<-cln.Disconnected()
-		fmt.Printf("[ %s ] is disconnected \n", cln.Addr())
+		log.Infof("[ %s ] is disconnected", cln.Addr())
 		// should app be terminated here? or restart scanning?
 		isConnected = false
 		close(done)
@@ -82,7 +130,7 @@ func main() {
 		        Value         0000 | "\x00\x00"
 	*/
 
-	fmt.Printf("Discovering profile...\n")
+	log.Info("Discovering profile...")
 	p, err := cln.DiscoverProfile(true)
 	if err != nil {
 		log.Fatalf("can't discover profile: %s", err)
@@ -102,30 +150,88 @@ func main() {
 		if err := cln.Unsubscribe(tempChar, false); err != nil {
 			log.Fatalf("unsubscribe failed: %s", err)
 		}
-		fmt.Printf("-- Unsubscribe to notification --\n")
+		log.Info("-- Unsubscribe to notification --")
 	}()
 
-	if *web {
-		startWeb()
-	} else {
-		if *sub == 0 {
-			for {
-				time.Sleep(time.Hour)
+	return cln, done
+}
+
+func atcMode(filter ble.AdvFilter) <-chan struct{} {
+	handleAdv := func(a ble.Advertisement) {
+		for _, l := range a.ServiceData() {
+			log.Debug("got something")
+			if l.UUID.Equal(ble.UUID16(0x181a)) {
+				buf := bytes.NewReader(l.Data)
+				buf.Seek(6, io.SeekStart)
+				var temperature_i int16
+				err := binary.Read(buf, binary.BigEndian, &temperature_i)
+				temperature = float64(temperature_i) / 10
+				if err != nil {
+					log.Infof("binary read failed: %v on [ % X ]\n", err, l.Data)
+				}
+				err = binary.Read(buf, binary.LittleEndian, &humidity)
+				if err != nil {
+					log.Infof("binary read failed: %v on [ % X ]\n", err, l.Data)
+				}
+				err = binary.Read(buf, binary.LittleEndian, &battery)
+				if err != nil {
+					log.Infof("binary read failed: %v on [ % X ]\n", err, l.Data)
+				}
+				var frame byte
+				buf.Seek(2, io.SeekCurrent)
+				err = binary.Read(buf, binary.LittleEndian, &frame)
+				if err != nil {
+					log.Infof("binary read failed: %v on [ % X ]\n", err, l.Data)
+				}
+				if lastFrame == frame {
+					log.WithFields(log.Fields{
+						"frame": frame,
+					}).Debug("Duplicated frame")
+					continue
+				}
+
+				lastFrame = frame
+				lastUpdate = time.Now()
+				if !*quiet {
+					log.WithFields(log.Fields{
+						"temperature": temperature,
+						"humidity":    humidity,
+						"battery":     battery,
+						"frame":       frame,
+					}).Info("Update")
+				}
 			}
-		} else {
-			time.Sleep(*sub)
 		}
 	}
+	ctx := ble.WithSigHandler(context.WithCancel(context.Background()))
+	go func() {
+		err := ble.Scan(ctx, true, handleAdv, filter)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+	return ctx.Done()
+}
 
-	// Disconnect the connection. (On OS X, this might take a while.)
-	fmt.Printf("Disconnecting [ %s ]... (this might take up to few seconds on OS X)\n", cln.Addr())
-	cln.CancelConnection()
-
-	<-done
+func startScan() {
+	handleAdv := func(a ble.Advertisement) {
+		log.WithFields(log.Fields{
+			"addr": a.Addr(),
+			"name": a.LocalName(),
+		}).Info("Device")
+	}
+	ctx := ble.WithSigHandler(context.WithTimeout(context.Background(), *sd))
+	err := ble.Scan(ctx, false, handleAdv, nil)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && os.IsTimeout(err) {
+			return
+		}
+		log.Fatal(err)
+	}
 }
 
 func startWeb() {
-	fmt.Println(`Up and running!
+	log.Info(`Up and running!
 	curl http://` + *webBind + `/
 To see the data.
 `)
@@ -160,23 +266,25 @@ func findTemperatureCharacteristic(cln ble.Client, p *ble.Profile) *ble.Characte
 }
 
 func subscribe(cln ble.Client, c *ble.Characteristic) error {
-	fmt.Printf("\n-- Subscribed notification --\n")
+	log.Info("\n-- Subscribed notification --\n")
 	h := func(req []byte) {
 		lastUpdate = time.Now()
 		buf := bytes.NewReader(req)
 		var temperature_i int16
 		err := binary.Read(buf, binary.LittleEndian, &temperature_i)
 		if err != nil {
-			fmt.Printf("binary read failed: %v on [ % X ]\n", err, req)
+			log.Errorf("binary read failed: %v on [ % X ]\n", err, req)
 		}
 		err = binary.Read(buf, binary.LittleEndian, &humidity)
 		if err != nil {
-			fmt.Printf("binary read failed: %v on [ % X ]\n", err, req)
+			log.Errorf("binary read failed: %v on [ % X ]\n", err, req)
 		}
 		temperature = float64(temperature_i) / 100
 		if !*quiet {
-			fmt.Println("Temperature: ", temperature)
-			fmt.Println("Humidity:    ", humidity)
+			log.WithFields(log.Fields{
+				"temperature": temperature,
+				"humidity":    humidity,
+			}).Info("Update")
 		}
 	}
 	if err := cln.Subscribe(c, false, h); err != nil {
