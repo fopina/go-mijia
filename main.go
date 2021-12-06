@@ -31,11 +31,12 @@ var (
 	web     = flag.Bool("web", false, "Make data available via HTTP (ignores -sub)")
 	webBind = flag.String("web-bind", "127.0.0.1:8989", "Address and port to bind the web webserver (-web)")
 
-	isConnected      = false
-	temperature      = 0.0
-	humidity    byte = 0
-	battery     byte = 0
-	lastUpdate  time.Time
+	advertisementMode      = false
+	isConnected            = false
+	temperature            = 0.0
+	humidity          byte = 0
+	battery           byte = 0
+	lastUpdate        time.Time
 	// used by ATC mode
 	lastFrame byte = 0
 )
@@ -74,6 +75,7 @@ func main() {
 	var done <-chan struct{}
 
 	if *atc {
+		advertisementMode = true
 		done = atcMode(filter)
 	} else {
 		cln, done = connectMode(filter)
@@ -235,8 +237,23 @@ func startWeb() {
 	curl http://` + *webBind + `/
 To see the data.
 `)
-	http.HandleFunc("/", httpHandler)
+	if advertisementMode {
+		http.HandleFunc("/", advertisementHttpHandler)
+	} else {
+		http.HandleFunc("/", httpHandler)
+	}
 	log.Fatal(http.ListenAndServe(*webBind, nil))
+}
+
+func advertisementHttpHandler(w http.ResponseWriter, r *http.Request) {
+	// avoid overhead of JSON marshalling when output is so simple!
+	fmt.Fprintf(w, `{
+	"temperature": %0.2f,
+	"humidity": %d,
+	"battery": %v,
+	"lastUpdate": "%v"
+}
+`, temperature, humidity, battery, lastUpdate.Format("2006-01-02T15:04:05-0700"))
 }
 
 func httpHandler(w http.ResponseWriter, r *http.Request) {
